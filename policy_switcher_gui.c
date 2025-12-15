@@ -130,7 +130,7 @@ int get_current_policy() {
     int value = -1;
 
     snprintf(command, sizeof(command),
-        "powercfg /query SCHEME_CURRENT %s %s",
+        "powercfg -query SCHEME_CURRENT %s %s",
         SUBGROUP_GUID, SETTING_GUID);
 
     if (run_hidden_command(command, buffer, sizeof(buffer))) {
@@ -156,32 +156,77 @@ int get_current_policy() {
     return value;
 }
 
-void set_policy(int policy_index) {
+int set_policy(int policy_index) {
     char command[512];
+    char output[2048];
+    int success = 1;
 
     // Set AC value
     snprintf(command, sizeof(command),
-        "powercfg /setacvalueindex SCHEME_CURRENT %s %s %d",
+        "powercfg -setacvalueindex SCHEME_CURRENT %s %s %d 2>&1",
         SUBGROUP_GUID, SETTING_GUID, policy_index);
-    run_hidden_command(command, NULL, 0);
+    run_hidden_command(command, output, sizeof(output));
+
+    if (output[0] != '\0') {
+        // Check for actual error (not just whitespace)
+        for (char* p = output; *p; p++) {
+            if (*p != ' ' && *p != '\n' && *p != '\r' && *p != '\t') {
+                success = 0;
+                break;
+            }
+        }
+    }
 
     // Set DC value (battery)
     snprintf(command, sizeof(command),
-        "powercfg /setdcvalueindex SCHEME_CURRENT %s %s %d",
+        "powercfg -setdcvalueindex SCHEME_CURRENT %s %s %d 2>&1",
         SUBGROUP_GUID, SETTING_GUID, policy_index);
-    run_hidden_command(command, NULL, 0);
+    run_hidden_command(command, output, sizeof(output));
+
+    if (output[0] != '\0') {
+        for (char* p = output; *p; p++) {
+            if (*p != ' ' && *p != '\n' && *p != '\r' && *p != '\t') {
+                success = 0;
+                break;
+            }
+        }
+    }
 
     // Apply changes
-    run_hidden_command("powercfg /setactive SCHEME_CURRENT", NULL, 0);
+    run_hidden_command("powercfg -setactive SCHEME_CURRENT 2>&1", output, sizeof(output));
+
+    return success;
 }
 
-void unhide_setting() {
+int unhide_setting() {
     char command[512];
+    char output[2048];
+
     // Unhide the setting so it can be queried and modified
     snprintf(command, sizeof(command),
         "powercfg -attributes %s %s -ATTRIB_HIDE",
         SUBGROUP_GUID, SETTING_GUID);
-    run_hidden_command(command, NULL, 0);
+
+    if (!run_hidden_command(command, output, sizeof(output))) {
+        return 0; // Failed to run command
+    }
+
+    // If there's error output, the command likely failed
+    if (output[0] != '\0') {
+        // Check if it's an actual error (not just whitespace)
+        int has_error = 0;
+        for (char* p = output; *p; p++) {
+            if (*p != ' ' && *p != '\n' && *p != '\r' && *p != '\t') {
+                has_error = 1;
+                break;
+            }
+        }
+        if (has_error) {
+            return 0; // Command produced error output
+        }
+    }
+
+    return 1; // Success
 }
 
 void play_beep(int policy_index) {
@@ -202,11 +247,13 @@ void cycle_policy_all(HWND hwnd) {
     int next_policy = (current_policy + 1) % NUM_POLICIES;
 
     // Apply new policy
-    set_policy(next_policy);
-    current_policy = next_policy;
-
-    // Beep for feedback
-    play_beep(next_policy);
+    if (set_policy(next_policy)) {
+        current_policy = next_policy;
+        play_beep(next_policy);
+    } else {
+        // Failed - beep low
+        Beep(200, 200);
+    }
 
     // Update UI if window is valid
     if (hwnd) {
@@ -225,11 +272,13 @@ void cycle_policy_perf(HWND hwnd) {
     else next_policy = 0;
 
     // Apply new policy
-    set_policy(next_policy);
-    current_policy = next_policy;
-
-    // Beep for feedback
-    play_beep(next_policy);
+    if (set_policy(next_policy)) {
+        current_policy = next_policy;
+        play_beep(next_policy);
+    } else {
+        // Failed - beep low
+        Beep(200, 200);
+    }
 
     // Update UI if window is valid
     if (hwnd) {
@@ -252,26 +301,9 @@ void update_ui_from_policy(HWND hwnd) {
         snprintf(status, sizeof(status), "Current: %s", POLICY_NAMES[current_policy]);
         SetWindowText(hStatusLabel, status);
     } else {
-        // Debug: show the actual output
-        char command[512];
-        char debug_output[2048];
-        snprintf(command, sizeof(command),
-            "powercfg /query SCHEME_CURRENT %s %s 2>&1",
-            SUBGROUP_GUID, SETTING_GUID);
-
-        if (run_hidden_command(command, debug_output, sizeof(debug_output))) {
-            // Show more of the output for debugging
-            char status[1024];
-            debug_output[500] = '\0'; // Show more
-            // Replace newlines with spaces for display
-            for (char* p = debug_output; *p; p++) {
-                if (*p == '\n' || *p == '\r') *p = ' ';
-            }
-            snprintf(status, sizeof(status), "ERROR - Output: %.500s", debug_output);
-            SetWindowText(hStatusLabel, status);
-        } else {
-            SetWindowText(hStatusLabel, "Error: CreateProcess failed");
-        }
+        SetWindowText(hStatusLabel,
+            "ERROR: This setting is not available on your system.\n"
+            "This feature requires a hybrid CPU (e.g. Intel 12th gen+ or AMD with E/P cores).");
 
         // Default to first option if we can't read
         SendMessage(hRadioButtons[0], BM_SETCHECK, BST_CHECKED, 0);
@@ -294,9 +326,13 @@ void apply_selected_policy(HWND hwnd) {
     if (selected >= 0) {
         SetWindowText(hStatusLabel, "Applying...");
 
-        set_policy(selected);
-        current_policy = selected;
-        play_beep(selected);
+        if (set_policy(selected)) {
+            current_policy = selected;
+            play_beep(selected);
+        } else {
+            SetWindowText(hStatusLabel, "ERROR: Failed to apply policy. Check admin rights and power plan settings.");
+            Beep(200, 200);
+        }
 
         Sleep(500);
         update_ui_from_policy(hwnd);
@@ -352,13 +388,31 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 hwnd, NULL, NULL, NULL);
 
             // Create hotkey info label
-            CreateWindow("STATIC", "Hotkeys: ALT+X (cycle all)  |  ALT+Z (cycle performance)",
+            CreateWindow("STATIC", "Hotkeys: ALT+X (cycle all)  |  ALT+V (cycle performance)",
                 WS_VISIBLE | WS_CHILD | SS_LEFT,
                 30, y_pos + 120, 420, 20,
                 hwnd, NULL, NULL, NULL);
 
             // Unhide the setting first (needs admin)
-            unhide_setting();
+            char unhide_cmd[512];
+            char unhide_output[2048];
+            snprintf(unhide_cmd, sizeof(unhide_cmd),
+                "powercfg -attributes %s %s -ATTRIB_HIDE 2>&1",
+                SUBGROUP_GUID, SETTING_GUID);
+
+            run_hidden_command(unhide_cmd, unhide_output, sizeof(unhide_output));
+
+            if (unhide_output[0] != '\0') {
+                // Show the actual error
+                char msg[3000];
+                snprintf(msg, sizeof(msg),
+                    "Failed to unhide the power setting.\n\n"
+                    "Command: %s\n\n"
+                    "Error output:\n%s\n\n"
+                    "The application may not work correctly.",
+                    unhide_cmd, unhide_output);
+                MessageBox(hwnd, msg, "Warning - Unhide Failed", MB_OK | MB_ICONWARNING);
+            }
 
             // Initial update
             update_ui_from_policy(hwnd);
@@ -371,8 +425,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 MessageBox(hwnd, "Failed to register ALT+X hotkey.\nAnother application may be using it.",
                           "Hotkey Registration Failed", MB_OK | MB_ICONWARNING);
             }
-            if (!RegisterHotKey(hwnd, HOTKEY_PERF, MOD_ALT, 'Z')) {
-                MessageBox(hwnd, "Failed to register ALT+Z hotkey.\nAnother application may be using it.",
+            if (!RegisterHotKey(hwnd, HOTKEY_PERF, MOD_ALT, 'V')) {
+                MessageBox(hwnd, "Failed to register ALT+V hotkey.\nAnother application may be using it.",
                           "Hotkey Registration Failed", MB_OK | MB_ICONWARNING);
             }
 
