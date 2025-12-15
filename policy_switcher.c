@@ -36,6 +36,15 @@ const char* POLICY_NAMES[] = {
 
 int current_policy = 0;
 
+void unhide_setting() {
+    char command[512];
+    // Unhide the setting so it can be queried and modified
+    snprintf(command, sizeof(command),
+        "powercfg -attributes %s %s -ATTRIB_HIDE",
+        SUBGROUP_GUID, SETTING_GUID);
+    system(command);
+}
+
 void play_beep(int policy_index) {
     // Different beep patterns for different policies
     // Higher frequency = higher policy number
@@ -51,7 +60,7 @@ int get_current_policy() {
 
     // Query current AC value for active scheme
     snprintf(command, sizeof(command),
-        "powercfg /query SCHEME_CURRENT %s %s",
+        "powercfg -query SCHEME_CURRENT %s %s",
         SUBGROUP_GUID, SETTING_GUID);
 
     pipe = _popen(command, "r");
@@ -76,18 +85,18 @@ void set_policy(int policy_index) {
 
     // Set AC value
     snprintf(command, sizeof(command),
-        "powercfg /setacvalueindex SCHEME_CURRENT %s %s %d",
+        "powercfg -setacvalueindex SCHEME_CURRENT %s %s %d",
         SUBGROUP_GUID, SETTING_GUID, policy_index);
     system(command);
 
     // Set DC value (battery)
     snprintf(command, sizeof(command),
-        "powercfg /setdcvalueindex SCHEME_CURRENT %s %s %d",
+        "powercfg -setdcvalueindex SCHEME_CURRENT %s %s %d",
         SUBGROUP_GUID, SETTING_GUID, policy_index);
     system(command);
 
     // Apply changes
-    system("powercfg /setactive SCHEME_CURRENT");
+    system("powercfg -setactive SCHEME_CURRENT");
 }
 
 void cycle_policy_all() {
@@ -134,6 +143,10 @@ int main() {
     printf("ALT+X: Cycle through all 6 policies\n");
     printf("ALT+Z: Cycle All/Performant/Prefer performant\n");
     printf("Press CTRL+C or close window to exit\n\n");
+
+    // Unhide the setting first (needs admin)
+    printf("Unhiding power setting...\n");
+    unhide_setting();
 
     // Get and display current policy
     int current = get_current_policy();
