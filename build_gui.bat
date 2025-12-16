@@ -7,7 +7,7 @@ REM Try MSVC first (cl.exe)
 where cl >nul 2>&1
 if !errorlevel!==0 (
     echo Building GUI version with MSVC...
-    cl /O2 /W3 policy_switcher_gui.c /Fe:policy_switcher_gui.exe user32.lib gdi32.lib /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED /MANIFESTINPUT:policy_switcher_gui.manifest
+    cl /O2 /W3 policy_switcher_gui.c /Fe:policy_switcher_gui.exe user32.lib gdi32.lib PowrProf.lib /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED /MANIFESTINPUT:policy_switcher_gui.manifest
     goto :done
 )
 
@@ -27,7 +27,7 @@ if !errorlevel!==0 (
     )
 
     echo Compiling and linking...
-    gcc -O2 -Wall -Werror -mwindows -o policy_switcher_gui.exe policy_switcher_gui.c manifest.o -luser32 -lgdi32
+    gcc -O2 -Wall -Werror -mwindows -o policy_switcher_gui.exe policy_switcher_gui.c manifest.o -luser32 -lgdi32 -lpowrprof
     set GCC_EXIT=!errorlevel!
     del manifest.o 2>nul
 
@@ -49,7 +49,7 @@ if exist policy_switcher_gui.exe (
     echo.
     echo Build successful: policy_switcher_gui.exe
     echo.
-    echo NOTE: Run as Administrator for powercfg to work properly
+    echo NOTE: Run as Administrator to modify power settings
 ) else (
     echo Build failed!
 )

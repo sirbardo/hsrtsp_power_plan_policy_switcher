@@ -1,6 +1,7 @@
 /*
  * Short Thread Policy Switcher - GUI Version
- * Shows current heterogeneous short running thread scheduling policy with radio buttons
+ * Controls the heterogeneous short running thread scheduling policy
+ * Uses Windows Power Management API directly (no powercfg dependency)
  *
  * Subgroup GUID: 54533251-82be-4824-96c1-47b60b740d00 (Processor power management)
  * Setting GUID:  bae08b81-2d5e-4688-ad6a-13243356654b (Short thread scheduling policy)
@@ -15,22 +16,33 @@
  */
 
 #include <windows.h>
+#include <powrprof.h>
 #include <stdio.h>
-#include <stdlib.h>
+
+#ifdef _MSC_VER
+#pragma comment(lib, "PowrProf.lib")
+#endif
 
 #define IDC_RADIO_BASE 1000
 #define IDC_REFRESH_BTN 2000
 #define IDC_APPLY_BTN 2001
 #define NUM_POLICIES 6
-#define WM_REFRESH_TIMER (WM_USER + 1)
 #define TIMER_ID 1
 #define HOTKEY_ALL 1
 #define HOTKEY_PERF 2
 
-const char* SUBGROUP_GUID = "54533251-82be-4824-96c1-47b60b740d00";
-const char* SETTING_GUID = "bae08b81-2d5e-4688-ad6a-13243356654b";
+// Power setting GUIDs
+static const GUID GUID_PROCESSOR_SUBGROUP = {
+    0x54533251, 0x82be, 0x4824,
+    {0x96, 0xc1, 0x47, 0xb6, 0x0b, 0x74, 0x0d, 0x00}
+};
 
-const char* POLICY_NAMES[] = {
+static const GUID GUID_SHORT_THREAD_POLICY = {
+    0xbae08b81, 0x2d5e, 0x4688,
+    {0xad, 0x6a, 0x13, 0x24, 0x33, 0x56, 0x65, 0x4b}
+};
+
+static const char* POLICY_NAMES[] = {
     "All processors",
     "Performant processors",
     "Prefer performant processors",
@@ -39,230 +51,99 @@ const char* POLICY_NAMES[] = {
     "Automatic"
 };
 
-HWND hRadioButtons[NUM_POLICIES];
-HWND hRefreshBtn;
-HWND hApplyBtn;
-HWND hStatusLabel;
-int current_policy = 0;
+static HWND hRadioButtons[NUM_POLICIES];
+static HWND hRefreshBtn;
+static HWND hApplyBtn;
+static HWND hStatusLabel;
+static int current_policy = 0;
+static DWORD last_error = ERROR_SUCCESS;
 
 // Forward declarations
 void update_ui_from_policy(HWND hwnd);
 void play_beep(int policy_index);
 
-int run_hidden_command(const char* command, char* output, int output_size) {
-    SECURITY_ATTRIBUTES sa = {0};
-    HANDLE hReadPipe, hWritePipe;
-    PROCESS_INFORMATION pi = {0};
-    STARTUPINFO si = {0};
-    DWORD bytesRead;
-
-    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
-    sa.bInheritHandle = TRUE;
-    sa.lpSecurityDescriptor = NULL;
-
-    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) {
-        return 0;
-    }
-
-    si.cb = sizeof(STARTUPINFO);
-    si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
-    si.wShowWindow = SW_HIDE;
-    si.hStdOutput = hWritePipe;
-    si.hStdError = hWritePipe;
-
-    char cmdline[1024];
-    snprintf(cmdline, sizeof(cmdline), "cmd.exe /c %s", command);
-
-    if (!CreateProcess(NULL, cmdline, NULL, NULL, TRUE, CREATE_NO_WINDOW,
-                       NULL, NULL, &si, &pi)) {
-        CloseHandle(hReadPipe);
-        CloseHandle(hWritePipe);
-        return 0;
-    }
-
-    CloseHandle(hWritePipe);
-
-    if (output && output_size > 0) {
-        output[0] = '\0';
-        DWORD totalRead = 0;
-        DWORD bytesAvailable;
-
-        // Read all output in a loop
-        while (totalRead < (DWORD)(output_size - 1)) {
-            // Check if there's data available
-            if (!PeekNamedPipe(hReadPipe, NULL, 0, NULL, &bytesAvailable, NULL)) {
-                break;
-            }
-
-            if (bytesAvailable == 0) {
-                // Wait a bit for more data
-                if (WaitForSingleObject(pi.hProcess, 100) == WAIT_OBJECT_0) {
-                    // Process finished, try one more read
-                    ReadFile(hReadPipe, output + totalRead, output_size - 1 - totalRead, &bytesRead, NULL);
-                    totalRead += bytesRead;
-                    break;
-                }
-                continue;
-            }
-
-            if (!ReadFile(hReadPipe, output + totalRead, output_size - 1 - totalRead, &bytesRead, NULL) || bytesRead == 0) {
-                break;
-            }
-
-            totalRead += bytesRead;
-        }
-
-        output[totalRead] = '\0';
-    }
-
-    WaitForSingleObject(pi.hProcess, 5000);
-
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    CloseHandle(hReadPipe);
-
-    return 1;
-}
-
 int get_current_policy() {
-    char command[512];
-    char buffer[4096];
-    int value = -1;
+    GUID *pActiveScheme = NULL;
+    DWORD value = 0;
+    int result = -1;
 
-    snprintf(command, sizeof(command),
-        "powercfg -query SCHEME_CURRENT %s %s",
-        SUBGROUP_GUID, SETTING_GUID);
+    DWORD status = PowerGetActiveScheme(NULL, &pActiveScheme);
+    if (status == ERROR_SUCCESS) {
+        status = PowerReadACValueIndex(NULL, pActiveScheme,
+            &GUID_PROCESSOR_SUBGROUP, &GUID_SHORT_THREAD_POLICY, &value);
 
-    if (run_hidden_command(command, buffer, sizeof(buffer))) {
-        char* line = buffer;
-        char* next;
-
-        while (line && *line) {
-            next = strchr(line, '\n');
-            if (next) *next = '\0';
-
-            if (strstr(line, "Current AC Power Setting Index:")) {
-                char* hex = strstr(line, "0x");
-                if (hex) {
-                    value = (int)strtol(hex, NULL, 16);
-                }
-                break;
-            }
-
-            line = next ? next + 1 : NULL;
+        if (status == ERROR_SUCCESS) {
+            result = (int)value;
         }
+        last_error = status;
+        LocalFree(pActiveScheme);
+    } else {
+        last_error = status;
     }
 
-    return value;
+    return result;
 }
 
 int set_policy(int policy_index) {
-    char command[512];
-    char output[2048];
-    int success = 1;
+    GUID *pActiveScheme = NULL;
+    int success = 0;
 
-    // Set AC value
-    snprintf(command, sizeof(command),
-        "powercfg -setacvalueindex SCHEME_CURRENT %s %s %d 2>&1",
-        SUBGROUP_GUID, SETTING_GUID, policy_index);
-    run_hidden_command(command, output, sizeof(output));
+    DWORD status = PowerGetActiveScheme(NULL, &pActiveScheme);
+    if (status == ERROR_SUCCESS) {
+        // Set AC value (plugged in)
+        DWORD result1 = PowerWriteACValueIndex(NULL, pActiveScheme,
+            &GUID_PROCESSOR_SUBGROUP, &GUID_SHORT_THREAD_POLICY, (DWORD)policy_index);
 
-    if (output[0] != '\0') {
-        // Check for actual error (not just whitespace)
-        for (char* p = output; *p; p++) {
-            if (*p != ' ' && *p != '\n' && *p != '\r' && *p != '\t') {
-                success = 0;
-                break;
-            }
+        // Set DC value (battery)
+        DWORD result2 = PowerWriteDCValueIndex(NULL, pActiveScheme,
+            &GUID_PROCESSOR_SUBGROUP, &GUID_SHORT_THREAD_POLICY, (DWORD)policy_index);
+
+        // Apply changes
+        DWORD result3 = PowerSetActiveScheme(NULL, pActiveScheme);
+
+        success = (result1 == ERROR_SUCCESS &&
+                   result2 == ERROR_SUCCESS &&
+                   result3 == ERROR_SUCCESS);
+
+        if (!success) {
+            last_error = result1 != ERROR_SUCCESS ? result1 :
+                        result2 != ERROR_SUCCESS ? result2 : result3;
         }
+
+        LocalFree(pActiveScheme);
+    } else {
+        last_error = status;
     }
-
-    // Set DC value (battery)
-    snprintf(command, sizeof(command),
-        "powercfg -setdcvalueindex SCHEME_CURRENT %s %s %d 2>&1",
-        SUBGROUP_GUID, SETTING_GUID, policy_index);
-    run_hidden_command(command, output, sizeof(output));
-
-    if (output[0] != '\0') {
-        for (char* p = output; *p; p++) {
-            if (*p != ' ' && *p != '\n' && *p != '\r' && *p != '\t') {
-                success = 0;
-                break;
-            }
-        }
-    }
-
-    // Apply changes
-    run_hidden_command("powercfg -setactive SCHEME_CURRENT 2>&1", output, sizeof(output));
 
     return success;
 }
 
-int unhide_setting() {
-    char command[512];
-    char output[2048];
-
-    // Unhide the setting so it can be queried and modified
-    snprintf(command, sizeof(command),
-        "powercfg -attributes %s %s -ATTRIB_HIDE",
-        SUBGROUP_GUID, SETTING_GUID);
-
-    if (!run_hidden_command(command, output, sizeof(output))) {
-        return 0; // Failed to run command
-    }
-
-    // If there's error output, the command likely failed
-    if (output[0] != '\0') {
-        // Check if it's an actual error (not just whitespace)
-        int has_error = 0;
-        for (char* p = output; *p; p++) {
-            if (*p != ' ' && *p != '\n' && *p != '\r' && *p != '\t') {
-                has_error = 1;
-                break;
-            }
-        }
-        if (has_error) {
-            return 0; // Command produced error output
-        }
-    }
-
-    return 1; // Success
-}
-
 void play_beep(int policy_index) {
-    // Different beep patterns for different policies
-    // Higher frequency = higher policy number
     int freq = 400 + (policy_index * 100);  // 400Hz to 900Hz
-    Beep(freq, 100);  // 100ms beep
+    Beep(freq, 100);
 }
 
 void cycle_policy_all(HWND hwnd) {
-    // Get current policy
     int current = get_current_policy();
     if (current >= 0 && current < NUM_POLICIES) {
         current_policy = current;
     }
 
-    // Cycle to next (all 6 policies)
     int next_policy = (current_policy + 1) % NUM_POLICIES;
 
-    // Apply new policy
     if (set_policy(next_policy)) {
         current_policy = next_policy;
         play_beep(next_policy);
     } else {
-        // Failed - beep low
-        Beep(200, 200);
+        Beep(200, 200);  // Error beep
     }
 
-    // Update UI if window is valid
     if (hwnd) {
         update_ui_from_policy(hwnd);
     }
 }
 
 void cycle_policy_perf(HWND hwnd) {
-    // Get current policy
     int current = get_current_policy();
 
     // Cycle between 0, 1, 2 (All, Performant, Prefer performant)
@@ -271,16 +152,13 @@ void cycle_policy_perf(HWND hwnd) {
     else if (current == 1) next_policy = 2;
     else next_policy = 0;
 
-    // Apply new policy
     if (set_policy(next_policy)) {
         current_policy = next_policy;
         play_beep(next_policy);
     } else {
-        // Failed - beep low
-        Beep(200, 200);
+        Beep(200, 200);  // Error beep
     }
 
-    // Update UI if window is valid
     if (hwnd) {
         update_ui_from_policy(hwnd);
     }
@@ -296,25 +174,36 @@ void update_ui_from_policy(HWND hwnd) {
                        (i == current_policy) ? BST_CHECKED : BST_UNCHECKED, 0);
         }
 
-        // Update status
         char status[256];
         snprintf(status, sizeof(status), "Current: %s", POLICY_NAMES[current_policy]);
         SetWindowText(hStatusLabel, status);
     } else {
-        SetWindowText(hStatusLabel,
-            "ERROR: This setting is not available on your system.\n"
-            "This feature requires a hybrid CPU (e.g. Intel 12th gen+ or AMD with E/P cores).");
+        // Error reading policy
+        char status[256];
+        if (last_error == ERROR_FILE_NOT_FOUND) {
+            snprintf(status, sizeof(status),
+                "ERROR: Setting not found.\n"
+                "Requires Windows with heterogeneous thread scheduling support.");
+        } else if (last_error == ERROR_ACCESS_DENIED) {
+            snprintf(status, sizeof(status),
+                "ERROR: Access denied.\n"
+                "Please run as Administrator.");
+        } else {
+            snprintf(status, sizeof(status),
+                "ERROR: Failed to read policy (code: %lu)", last_error);
+        }
+        SetWindowText(hStatusLabel, status);
 
-        // Default to first option if we can't read
         SendMessage(hRadioButtons[0], BM_SETCHECK, BST_CHECKED, 0);
+        for (int i = 1; i < NUM_POLICIES; i++) {
+            SendMessage(hRadioButtons[i], BM_SETCHECK, BST_UNCHECKED, 0);
+        }
     }
 }
 
 void apply_selected_policy(HWND hwnd) {
-    // Disable timer to prevent interference
     KillTimer(hwnd, TIMER_ID);
 
-    // Find which radio button is selected
     int selected = -1;
     for (int i = 0; i < NUM_POLICIES; i++) {
         if (SendMessage(hRadioButtons[i], BM_GETCHECK, 0, 0) == BST_CHECKED) {
@@ -330,11 +219,19 @@ void apply_selected_policy(HWND hwnd) {
             current_policy = selected;
             play_beep(selected);
         } else {
-            SetWindowText(hStatusLabel, "ERROR: Failed to apply policy. Check admin rights and power plan settings.");
+            char status[256];
+            if (last_error == ERROR_ACCESS_DENIED) {
+                snprintf(status, sizeof(status),
+                    "ERROR: Access denied. Run as Administrator.");
+            } else {
+                snprintf(status, sizeof(status),
+                    "ERROR: Failed to apply (code: %lu)", last_error);
+            }
+            SetWindowText(hStatusLabel, status);
             Beep(200, 200);
         }
 
-        Sleep(500);
+        Sleep(300);
         update_ui_from_policy(hwnd);
     }
 
@@ -344,33 +241,26 @@ void apply_selected_policy(HWND hwnd) {
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
         case WM_CREATE: {
-            // Create title label
             CreateWindow("STATIC", "Short Thread Scheduling Policy:",
                         WS_VISIBLE | WS_CHILD,
                         20, 10, 300, 20,
                         hwnd, NULL, NULL, NULL);
 
-            // Create radio buttons
             int y_pos = 40;
             for (int i = 0; i < NUM_POLICIES; i++) {
                 char label[256];
                 snprintf(label, sizeof(label), "%d - %s", i, POLICY_NAMES[i]);
 
-                // Only first radio button gets WS_GROUP to create a group
                 DWORD style = WS_VISIBLE | WS_CHILD | BS_AUTORADIOBUTTON;
-                if (i == 0) {
-                    style |= WS_GROUP;
-                }
+                if (i == 0) style |= WS_GROUP;
 
                 hRadioButtons[i] = CreateWindow("BUTTON", label,
-                    style,
-                    30, y_pos, 350, 25,
+                    style, 30, y_pos, 350, 25,
                     hwnd, (HMENU)(LONG_PTR)(IDC_RADIO_BASE + i), NULL, NULL);
 
                 y_pos += 30;
             }
 
-            // Create buttons
             hRefreshBtn = CreateWindow("BUTTON", "Refresh",
                 WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
                 30, y_pos + 10, 100, 30,
@@ -381,53 +271,27 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 140, y_pos + 10, 100, 30,
                 hwnd, (HMENU)IDC_APPLY_BTN, NULL, NULL);
 
-            // Create status label - make it bigger for debug output
             hStatusLabel = CreateWindow("STATIC", "Initializing...",
                 WS_VISIBLE | WS_CHILD | SS_LEFT,
                 30, y_pos + 50, 420, 60,
                 hwnd, NULL, NULL, NULL);
 
-            // Create hotkey info label
             CreateWindow("STATIC", "Hotkeys: ALT+X (cycle all)  |  ALT+V (cycle performance)",
                 WS_VISIBLE | WS_CHILD | SS_LEFT,
                 30, y_pos + 120, 420, 20,
                 hwnd, NULL, NULL, NULL);
 
-            // Unhide the setting first (needs admin)
-            char unhide_cmd[512];
-            char unhide_output[2048];
-            snprintf(unhide_cmd, sizeof(unhide_cmd),
-                "powercfg -attributes %s %s -ATTRIB_HIDE 2>&1",
-                SUBGROUP_GUID, SETTING_GUID);
-
-            run_hidden_command(unhide_cmd, unhide_output, sizeof(unhide_output));
-
-            if (unhide_output[0] != '\0') {
-                // Show the actual error
-                char msg[3000];
-                snprintf(msg, sizeof(msg),
-                    "Failed to unhide the power setting.\n\n"
-                    "Command: %s\n\n"
-                    "Error output:\n%s\n\n"
-                    "The application may not work correctly.",
-                    unhide_cmd, unhide_output);
-                MessageBox(hwnd, msg, "Warning - Unhide Failed", MB_OK | MB_ICONWARNING);
-            }
-
-            // Initial update
             update_ui_from_policy(hwnd);
 
-            // Set timer for auto-refresh every 2 seconds
             SetTimer(hwnd, TIMER_ID, 2000, NULL);
 
-            // Register global hotkeys
             if (!RegisterHotKey(hwnd, HOTKEY_ALL, MOD_ALT, 'X')) {
-                MessageBox(hwnd, "Failed to register ALT+X hotkey.\nAnother application may be using it.",
-                          "Hotkey Registration Failed", MB_OK | MB_ICONWARNING);
+                MessageBox(hwnd, "Failed to register ALT+X hotkey.",
+                          "Warning", MB_OK | MB_ICONWARNING);
             }
             if (!RegisterHotKey(hwnd, HOTKEY_PERF, MOD_ALT, 'V')) {
-                MessageBox(hwnd, "Failed to register ALT+V hotkey.\nAnother application may be using it.",
-                          "Hotkey Registration Failed", MB_OK | MB_ICONWARNING);
+                MessageBox(hwnd, "Failed to register ALT+V hotkey.",
+                          "Warning", MB_OK | MB_ICONWARNING);
             }
 
             return 0;
@@ -450,8 +314,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         case WM_COMMAND:
             if (LOWORD(wParam) == IDC_REFRESH_BTN) {
                 update_ui_from_policy(hwnd);
-            }
-            else if (LOWORD(wParam) == IDC_APPLY_BTN) {
+            } else if (LOWORD(wParam) == IDC_APPLY_BTN) {
                 apply_selected_policy(hwnd);
             }
             return 0;
@@ -469,6 +332,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                    LPSTR lpCmdLine, int nCmdShow) {
+    (void)hPrevInstance;
+    (void)lpCmdLine;
+
     const char CLASS_NAME[] = "PolicySwitcherWindow";
 
     WNDCLASS wc = {0};
@@ -481,20 +347,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     RegisterClass(&wc);
 
     HWND hwnd = CreateWindowEx(
-        0,
-        CLASS_NAME,
-        "Short Thread Policy Switcher",
+        0, CLASS_NAME, "Short Thread Policy Switcher",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT, 500, 400,
-        NULL,
-        NULL,
-        hInstance,
-        NULL
+        NULL, NULL, hInstance, NULL
     );
 
-    if (hwnd == NULL) {
-        return 0;
-    }
+    if (hwnd == NULL) return 0;
 
     ShowWindow(hwnd, nCmdShow);
 

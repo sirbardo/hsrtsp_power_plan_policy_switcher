@@ -74,10 +74,10 @@ Prefer not to build? Download pre-compiled executables from the [Releases](../..
 
 ## Technical Details
 
+Uses the Windows Power Management API (`powrprof.dll`) directly - no dependency on `powercfg.exe`.
+
 Modifies the Windows power setting:
 - **Subgroup GUID**: `54533251-82be-4824-96c1-47b60b740d00` (Processor power management)
 - **Setting GUID**: `bae08b81-2d5e-4688-ad6a-13243356654b` (Heterogeneous short running thread scheduling policy)
 
 You can find more details on the current hypothesis on how this affects FPS here: https://x.com/bardozVAL/status/1999931009119162572
-
-This setting is hidden by default. The app automatically unhides it on first run.
